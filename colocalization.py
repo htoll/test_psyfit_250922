@@ -1,7 +1,4 @@
 
-# streamlit entry module for "UNDER CONSTRUCTION Colocalization Set"
-# Minimal UI: show matched UCNP↔Dye SIFs in two columns with selectable overlays.
-
 import os
 import re
 import io
@@ -72,48 +69,101 @@ def _process_files(uploaded_files, region, threshold, signal):
         return _process_files_external(uploaded_files, region, threshold=threshold, signal=signal, pix_size_um=PIX_SIZE_UM)
     return _process_files_fallback(uploaded_files, region, threshold=threshold, signal=signal, pix_size_um=PIX_SIZE_UM)
 
-def _split_ucnp_dye(files):
-    # Prefer utils sorter if available
-    if hasattr(utils, "sort_UCNP_dye_sifs"):
-        return utils.sort_UCNP_dye_sifs(files)
-    # Fallback by guessing from name
+def _split_ucnp_dye(files, ucnp_id="976", dye_id="638"):
+    """
+    Split uploaded SIFs into UCNP vs Dye sets by filename tokens.
+    - Case-insensitive substring match.
+    - If both tokens appear in a filename, we warn and skip that file.
+    - If neither token appears, we warn and skip that file.
+    """
+    u_tok = str(ucnp_id).lower().strip()
+    d_tok = str(dye_id).lower().strip()
+
     ucnp, dye = [], []
     for f in files:
-        name = f.name.lower()
-        if "976" in name and "638" not in name:
-            ucnp.append(f)
-        elif "638" in name and "976" not in name:
-            dye.append(f)
-    return ucnp, dye
+        name = f.name
+        lname = name.lower()
 
-def _match_ucnp_dye_files(ucnps: List[str], dyes: List[str]) -> List[Tuple[str, str]]:
+        has_ucnp = u_tok in lname if u_tok else False
+        has_dye  = d_tok in lname if d_tok else False
+
+        if has_ucnp and not has_dye:
+            ucnp.append(f)
+        elif has_dye and not has_ucnp:
+            dye.append(f)
+        elif has_ucnp and has_dye:
+            st.warning(f"Filename matches both tokens — skipping: {name}")
+        else:
+            st.warning(f"Filename matches neither token — skipping: {name}")
+
+    return ucnp, dye
+def _match_ucnp_dye_files(ucnps: List[str], dyes: List[str], u_token="IR", d_token="red") -> List[Tuple[str, str]]:
     # Deterministic sort
     u_sorted = sorted(ucnps, key=natural_sort_key)
     d_sorted = sorted(dyes, key=natural_sort_key)
-    # Build a lookup from trailing index -> full name
-    d_map = {}
-    for fn in d_sorted:
-        m = re.search(r"(\d+)\.sif$", fn)
-        if m:
-            d_map[int(m.group(1))] = fn
-    pairs = []
-    used = set()
-    for uf in u_sorted:
-        m = re.search(r"(\d+)\.sif$", uf)
-        if not m:
-            continue
-        uidx = int(m.group(1))
-        cand = []
-        if (uidx + 1) in d_map and (uidx + 1) not in used:
-            cand.append(uidx + 1)
-        if (uidx - 1) in d_map and (uidx - 1) not in used:
-            cand.append(uidx - 1)
-        if cand:
-            choice = cand[0]
-            pairs.append((uf, d_map[choice]))
-            used.add(choice)
-    return pairs
 
+    # --- Strategy A: trailing index pairing (original behavior) ---
+    def tail_index(fn: str):
+        m = re.search(r"(\d+)\.sif$", fn, flags=re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    d_by_idx = {idx: fn for fn in d_sorted if (idx := tail_index(fn)) is not None}
+    pairs: List[Tuple[str, str]] = []
+    used_d = set()
+
+    for uf in u_sorted:
+        uidx = tail_index(uf)
+        if uidx is None:
+            continue
+        for cand in (uidx + 1, uidx - 1):
+            if cand in d_by_idx and cand not in used_d:
+                pairs.append((uf, d_by_idx[cand]))
+                used_d.add(cand)
+                break
+
+    # If Strategy A found matches for all, return early
+    if pairs and len(pairs) == min(len(u_sorted), len(d_sorted)):
+        return pairs
+
+    # --- Strategy B: normalized stem equality ---
+    def normalize_stem(fn: str) -> str:
+        stem = os.path.splitext(os.path.basename(fn))[0].lower()
+        # remove tokened drive terms like "IR1500mA" / "red80mA"
+        if u_token:
+            stem = re.sub(rf"{re.escape(u_token.lower())}\s*\d+\s*m?a?", "", stem)
+        if d_token:
+            stem = re.sub(rf"{re.escape(d_token.lower())}\s*\d+\s*m?a?", "", stem)
+        # collapse separators and spaces
+        stem = stem.replace("_", " ")
+        stem = re.sub(r"\s+", " ", stem).strip()
+        return stem
+
+    # Build map for dyes by normalized stem (skip the ones already used by A)
+    d_norm_map: Dict[str, str] = {}
+    for df in d_sorted:
+        if df in {pair[1] for pair in pairs}:
+            continue
+        d_norm_map.setdefault(normalize_stem(df), df)
+
+    # Try to pair remaining U files by equal normalized stem
+    used_d_files = {p[1] for p in pairs}
+    for uf in u_sorted:
+        if uf in {p[0] for p in pairs}:
+            continue
+        key = normalize_stem(uf)
+        df = d_norm_map.get(key)
+        if df and df not in used_d_files:
+            pairs.append((uf, df))
+            used_d_files.add(df)
+
+    # --- Strategy C: fallback by order (only for any still-unpaired) ---
+    if len(pairs) < min(len(u_sorted), len(d_sorted)):
+        remaining_u = [u for u in u_sorted if u not in {p[0] for p in pairs}]
+        remaining_d = [d for d in d_sorted if d not in {p[1] for p in pairs}]
+        for uf, df in zip(remaining_u, remaining_d):
+            pairs.append((uf, df))
+
+    return pairs
 def _overlay_circles(ax, df: pd.DataFrame, color: str, alpha: float, label: bool = False):
     from matplotlib.patches import Circle
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -158,55 +208,42 @@ def _compute_coloc_mask(df_u: pd.DataFrame, df_d: pd.DataFrame, radius_px: int):
 
 # --- App ---
 def run():
-    st.title("Colocalization Set (UNDER CONSTRUCTION)")
-    st.caption("Matched UCNP↔Dye SIFs in two columns with overlays. Uses your existing fitting pipeline.")
 
     with st.sidebar:
         st.header("Inputs")
         sif_files = st.file_uploader("SIF files (UCNP + Dye)", type=["sif"], accept_multiple_files=True)
         csv_help = "Optional: upload one combined CSV with a 'sif_name'/'file' column, or per-image CSVs."
-        fit_csvs = st.file_uploader("Fit CSVs (optional)", type=["csv"], accept_multiple_files=True, help=csv_help)
+        st.header("IDs")
+        ucnp_id = st.text_input("UCNP ID token", value="976", help="Substring used to identify UCNP files (matched in filename).")
+        dye_id  = st.text_input("Dye ID token",  value="638", help="Substring used to identify Dye files (matched in filename).")
 
         st.divider()
         st.header("Fitting")
         threshold = st.number_input("Threshold", min_value=0, value=2)
-        region = st.selectbox("Region", options=["1","2","3","4","all"], index=4)
+        region_ucnp = st.selectbox("Region (UCNP)", options=["1","2","3","4","all"], index=0)
+        region_dye  = st.selectbox("Region (Dye)",  options=["1","2","3","4","all"], index=0)
         radius_px = st.number_input("Colocalization radius (pixels)", min_value=1, value=2)
 
         st.header("Overlays")
-        show_all_fits = st.checkbox("Show ALL fits", value=True)
-        show_coloc_fits = st.checkbox("Show COLOCALIZED fits", value=True)
+        show_all_fits = st.checkbox("Show all fits", value=False)
+        show_coloc_fits = st.checkbox("Show colocalized fits", value=True)
 
         st.header("Display")
         cmap = st.selectbox("Colormap", options=["magma","viridis","plasma","hot","gray","hsv"], index=0)
         use_lognorm = st.checkbox("Log image scaling", value=True)
+        show_colorbars = st.checkbox("Show colorbars on images", value=False)  # ← Add this
+
 
     if not sif_files:
         st.info("Upload SIF files to begin.")
         return
 
     # Optional: load fit CSVs
-    fit_map: Dict[str, pd.DataFrame] = {}
-    if fit_csvs:
-        if len(fit_csvs) == 1:
-            df = pd.read_csv(fit_csvs[0])
-            name_col = next((c for c in df.columns if c.lower() in ("sif_name","filename","file","image","sif")), None)
-            if name_col:
-                for name, sub in df.groupby(name_col):
-                    base = os.path.basename(str(name))
-                    fit_map[os.path.splitext(base)[0]] = sub.reset_index(drop=True)
-        if not fit_map:
-            for f in fit_csvs:
-                base_noext = os.path.splitext(os.path.basename(f.name))[0]
-                try:
-                    fit_map[base_noext] = pd.read_csv(f)
-                except Exception as e:
-                    st.warning(f"Could not read CSV '{f.name}': {e}")
 
     # Split & process
-    ucnp_files, dye_files = _split_ucnp_dye(sif_files)
-    u_data, _ = _process_files(ucnp_files, region=region, threshold=threshold, signal="UCNP") if ucnp_files else ({}, pd.DataFrame())
-    d_data, _ = _process_files(dye_files,  region=region, threshold=threshold, signal="dye")   if dye_files  else ({}, pd.DataFrame())
+    ucnp_files, dye_files = _split_ucnp_dye(sif_files, ucnp_id=ucnp_id, dye_id=dye_id)
+    u_data, _ = _process_files(ucnp_files, region=region_ucnp, threshold=threshold, signal="UCNP") if ucnp_files else ({}, pd.DataFrame())
+    d_data, _ = _process_files(dye_files,  region=region_dye, threshold=threshold, signal="dye")   if dye_files  else ({}, pd.DataFrame())
 
     # Build simple name lists for matching (just the .name keys we used in dicts)
     u_names = sorted(list(u_data.keys()), key=natural_sort_key)
@@ -219,10 +256,13 @@ def run():
     from matplotlib.colors import LogNorm
 
     # Accumulate matched-peak rows
-            tab_pairs, tab_plots = st.tabs(["Pairs", "Plots"])
+    tab_pairs, tab_plots = st.tabs(["Pairs", "Plots"])
 
-        with tab_pairs:
-matched_rows = []
+    with tab_pairs:
+        matched_rows = []
+        overall_placeholder = st.empty()
+        overall_ucnp_hits = overall_ucnp_total = 0
+        overall_dye_hits  = overall_dye_total  = 0
 
     # Render each pair as a row with 2 columns
     for u_name, d_name in pairs:
@@ -233,19 +273,20 @@ matched_rows = []
         # Prefer CSV fits if present
         base_u = os.path.splitext(os.path.basename(u_name))[0]
         base_d = os.path.splitext(os.path.basename(d_name))[0]
-        if base_u in fit_map: u_df = fit_map[base_u]
-        if base_d in fit_map: d_df = fit_map[base_d]
         u_img = u_bundle.get("image", None)
         d_img = d_bundle.get("image", None)
 
         colL, colR = st.columns(2)
         with colL:
             st.markdown(f"**UCNP:** {u_name}")
+
             if isinstance(u_img, np.ndarray):
                 fig_u, ax_u = plt.subplots(figsize=(5,5))
                 ax_u.set_xticks([]); ax_u.set_yticks([])
                 norm = LogNorm() if use_lognorm else None
-                ax_u.imshow(u_img + 1, cmap=cmap, norm=norm, origin="lower")
+                im_u = ax_u.imshow(u_img + 1, cmap=cmap, norm=norm, origin="lower")  
+                if show_colorbars:
+                    fig_u.colorbar(im_u, ax=ax_u, fraction=0.046, pad=0.04)          
             else:
                 fig_u, ax_u = plt.subplots(figsize=(5,5))
                 ax_u.text(0.5,0.5,"No image", ha="center", va="center"); ax_u.axis("off")
@@ -256,13 +297,38 @@ matched_rows = []
                 fig_d, ax_d = plt.subplots(figsize=(5,5))
                 ax_d.set_xticks([]); ax_d.set_yticks([])
                 norm = LogNorm() if use_lognorm else None
-                ax_d.imshow(d_img + 1, cmap=cmap, norm=norm, origin="lower")
+                im_d = ax_d.imshow(d_img + 1, cmap=cmap, norm=norm, origin="lower")
+                if show_colorbars:
+                    fig_d.colorbar(im_d, ax=ax_d, fraction=0.046, pad=0.04)
             else:
                 fig_d, ax_d = plt.subplots(figsize=(5,5))
                 ax_d.text(0.5,0.5,"No image", ha="center", va="center"); ax_d.axis("off")
 
         # Compute coloc mask & overlay
         u_mask, d_mask, pair_idx = _compute_coloc_mask(u_df, d_df, radius_px=radius_px)
+        if isinstance(u_df, pd.DataFrame) and not u_df.empty and u_mask is not None:
+            u_total = len(u_df)
+            u_hits = int(u_mask.sum())
+            percent_ucnp_coloc = 100.0 * u_hits / max(u_total, 1)
+        else:
+            u_total = 0; u_hits = 0; percent_ucnp_coloc = 0.0
+
+        
+        if isinstance(d_df, pd.DataFrame) and not d_df.empty and d_mask is not None:
+            d_total = len(d_df)
+            d_hits = int(d_mask.sum())
+            percent_dye_coloc = 100.0 * d_hits / max(d_total, 1)
+        else:
+            d_total = 0; d_hits = 0; percent_dye_coloc = 0.0
+        st.markdown(f"**Colocalized:** UCNP {u_hits}/{u_total} ({percent_ucnp_coloc:.1f}%) — Dye {d_hits}/{d_total} ({percent_dye_coloc:.1f}%)")
+
+        
+        overall_ucnp_hits += u_hits
+        overall_ucnp_total += u_total
+        overall_dye_hits  += d_hits
+        overall_dye_total  += d_total
+
+
 
         # Overlays
         if show_all_fits:
@@ -290,13 +356,22 @@ matched_rows = []
                         "distance_px": dist,
                     })
 
+
         with colL: st.pyplot(fig_u)
         with colR: st.pyplot(fig_d)
+        overall_ucnp_pct = 100.0 * overall_ucnp_hits / max(overall_ucnp_total, 1)
+        overall_dye_pct  = 100.0 * overall_dye_hits  / max(overall_dye_total, 1)
+        overall_placeholder.markdown(
+            f"### Overall colocalized: "
+            f"UCNP {overall_ucnp_hits}/{overall_ucnp_total} ({overall_ucnp_pct:.1f}%) — "
+            f"Dye {overall_dye_hits}/{overall_dye_total} ({overall_dye_pct:.1f}%)"
+        )
+
 
     # Download matched results CSV
     if matched_rows:
         matched_df = pd.DataFrame(matched_rows)
-            st.session_state['coloc_matched_df'] = matched_df
+        st.session_state['coloc_matched_df'] = matched_df
 
         st.download_button(
             "Download colocalized pairs (CSV)",
@@ -307,13 +382,14 @@ matched_rows = []
 
 
 
+
         with tab_plots:
             st.subheader("Plots")
             matched_df = st.session_state.get("coloc_matched_df", pd.DataFrame())
             if matched_df is None or matched_df.empty:
                 st.info("No matched peaks yet — open the Pairs tab first.")
             else:
-                mode = st.radio("Single-particle brightness", ["Automatic (Gaussian μ)", "Manual (enter pps)"], index=0, help="Automatic assumes most PSFs are single particles. If this is not true, use Manual.")
+                mode = st.radio("Single-particle brightness", ["Manual (enter pps)","Automatic (Gaussian μ)"], index=0, help="Automatic assumes most PSFs are single particles. If this is not true, use Manual.")
                 st.warning("Automatic mode assumes the majority of PSFs are single particles.")
 
                 if mode.startswith("Automatic"):
@@ -344,7 +420,12 @@ matched_rows = []
                 md["num_ucnps"] = md["ucnp_brightness"].astype(float) / max(single_ucnp_brightness, 1e-12)
                 md["num_dyes"]  = md["dye_brightness"].astype(float)  / max(single_dye_brightness,  1e-12)
 
-                thresh_factor = st.number_input("Exclude UCNPs below factor × single UCNP", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+
+                thresh_factor = st.number_input(
+                                "UCNP quality cutoff (× single UCNP brightness)",
+                                min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+                                help="Exclude points with UCNP brightness below factor × single-UCNP brightness."
+                            )
                 thresholded_df = md[md["ucnp_brightness"] >= thresh_factor * single_ucnp_brightness].copy()
 
                 import matplotlib.pyplot as plt
@@ -354,7 +435,9 @@ matched_rows = []
                 ax_sc2.set_ylabel("Number of Dyes per PSF")
                 ax_sc2.set_title("Matched UCNPs")
                 ax_sc2.set_xlim(0, 5)
-                st.pyplot(fig_sc2)
+                colA, colB = st.columns(2)
+                with colA:
+                    st.pyplot(fig_sc2)
 
                 msk = (thresholded_df["num_ucnps"] >= 0) & (thresholded_df["num_ucnps"] <= 2)
                 y_subset = thresholded_df.loc[msk, "num_dyes"].dropna().to_numpy()
@@ -369,8 +452,8 @@ matched_rows = []
                     ax_h2.set_title("Single UCNPs: no data in [0, 2] after threshold")
                 ax_h2.set_xlabel("Number of Dyes per Single UCNP")
                 ax_h2.set_ylabel("Count")
-                st.pyplot(fig_h2)
-
+                with colB:
+                    st.pyplot(fig_h2)
                 st.download_button(
                     "Download thresholded results (CSV)",
                     data=thresholded_df.to_csv(index=False).encode("utf-8"),
